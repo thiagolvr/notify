@@ -538,26 +538,24 @@ impl EventLoop {
                     let mut inotify_watches = inotify.watches();
                     log::trace!("removing inotify watch: {}", path.display());
 
-                    inotify_watches
-                        .remove(w.clone())
-                        .map_err(|e| Error::io(e).add_path(path.clone()))?;
                     self.paths.remove(&w);
+                    let mut result = remove_kernel_watch(&mut inotify_watches, w, &path);
 
                     if is_recursive || remove_recursive {
-                        let mut remove_list = Vec::new();
-                        for (w, p) in &self.paths {
-                            if p.starts_with(&path) {
-                                inotify_watches
-                                    .remove(w.clone())
-                                    .map_err(|e| Error::io(e).add_path(p.into()))?;
-                                self.watches.remove(p);
-                                remove_list.push(w.clone());
-                            }
-                        }
-                        for w in remove_list {
+                        let descendants: Vec<_> = self
+                            .paths
+                            .iter()
+                            .filter(|(_, p)| p.starts_with(&path))
+                            .map(|(w, p)| (w.clone(), p.clone()))
+                            .collect();
+                        for (w, p) in descendants {
                             self.paths.remove(&w);
+                            self.watches.remove(&p);
+                            let removed = remove_kernel_watch(&mut inotify_watches, w, &p);
+                            result = result.and(removed);
                         }
                     }
+                    return result;
                 }
             }
         }
@@ -568,14 +566,24 @@ impl EventLoop {
         if let Some(ref mut inotify) = self.inotify {
             let mut inotify_watches = inotify.watches();
             for (w, p) in &self.paths {
-                inotify_watches
-                    .remove(w.clone())
-                    .map_err(|e| Error::io(e).add_path(p.into()))?;
+                remove_kernel_watch(&mut inotify_watches, w.clone(), p)?;
             }
             self.watches.clear();
             self.paths.clear();
         }
         Ok(())
+    }
+}
+
+fn remove_kernel_watch(
+    inotify_watches: &mut inotify_sys::Watches,
+    w: WatchDescriptor,
+    path: &Path,
+) -> Result<()> {
+    match inotify_watches.remove(w) {
+        // The kernel already dropped the watch because the watched path was deleted.
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        result => result.map_err(|e| Error::io(e).add_path(path.to_path_buf())),
     }
 }
 
@@ -673,4 +681,29 @@ impl Drop for INotifyWatcher {
 fn inotify_watcher_is_send_and_sync() {
     fn check<T: Send + Sync>() {}
     check::<INotifyWatcher>();
+}
+
+#[test]
+fn removing_root_after_deleting_watched_subdirectory_leaves_no_stale_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let deleted = root.join("deleted");
+    let kept = root.join("kept");
+    std::fs::create_dir(&deleted).unwrap();
+    std::fs::create_dir(&kept).unwrap();
+
+    let mut event_loop = EventLoop::new(Inotify::init().unwrap(), Box::new(|_| {}), false).unwrap();
+    event_loop
+        .add_watch(root.clone(), true, true, WatchFilter::accept_all())
+        .unwrap();
+    assert_eq!(event_loop.paths.len(), 3);
+
+    std::fs::remove_dir(&deleted).unwrap();
+    event_loop.handle_inotify();
+    assert!(!event_loop.watches.contains_key(&deleted));
+    assert!(!event_loop.paths.values().any(|path| path == &deleted));
+
+    event_loop.remove_watch(root, false).unwrap();
+    assert!(event_loop.watches.is_empty());
+    assert!(event_loop.paths.is_empty());
 }
